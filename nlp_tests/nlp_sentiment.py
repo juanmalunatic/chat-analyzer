@@ -6,29 +6,12 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from conversation_features import (
     load_prompts_labels_meta,
-    run_sentiment_scoring_transformer,
+    run_sentiment_labeling,
 )
 
 TEST_PATH = Path("../data/test_3851.jsonl")
 OUT_DIR = Path("outputs")
 OUT_DIR.mkdir(exist_ok=True)
-
-
-def to_ternary_label(d: dict) -> str:
-    lab = str(d.get("label", "")).lower()
-
-    if "neg" in lab or "negative" in lab:
-        return "NEGATIVE"
-    if "pos" in lab or "positive" in lab:
-        return "POSITIVE"
-    if "neu" in lab or "neutral" in lab:
-        return "NEUTRAL"
-
-    if lab == "label_0":
-        return "NEGATIVE"
-    if lab == "label_2":
-        return "POSITIVE"
-    return "NEUTRAL"
 
 
 def run_with_timing(fn, *args, **kwargs):
@@ -55,27 +38,23 @@ def main():
 
     # 1) Proxy truth: RoBERTa
     print("\nRunning RoBERTa (proxy truth)...")
-    roberta_out, t = run_with_timing(run_sentiment_scoring_transformer, X_test, model="roberta")
+    y_ref, t = run_with_timing(run_sentiment_labeling, X_test, model="roberta")
     timings["RoBERTa"] = t
-    y_ref = [to_ternary_label(d) for d in roberta_out]
 
     # 2) BERTweet
     print("\nRunning BERTweet...")
-    bertweet_out, t = run_with_timing(run_sentiment_scoring_transformer, X_test, model="bertweet")
+    y_bertweet, t = run_with_timing(run_sentiment_labeling, X_test, model="bertweet")
     timings["BERTweet"] = t
-    y_bertweet = [to_ternary_label(d) for d in bertweet_out]
 
     # 3) Multilingual
     print("\nRunning Multilingual...")
-    multi_out, t = run_with_timing(run_sentiment_scoring_transformer, X_test, model="multilingual")
+    y_multi, t = run_with_timing(run_sentiment_labeling, X_test, model="multilingual")
     timings["Multilingual"] = t
-    y_multi = [to_ternary_label(d) for d in multi_out]
 
     # 4) VADER
     print("\nRunning VADER...")
-    vader_out, t = run_with_timing(run_sentiment_scoring_transformer, X_test, model="vader")
+    y_vader, t = run_with_timing(run_sentiment_labeling, X_test, model="vader")
     timings["VADER"] = t
-    y_vader = [to_ternary_label(d) for d in vader_out]
 
     # Agreement vs RoBERTa
     print("\n=== Agreement vs RoBERTa (proxy) ===")
@@ -122,8 +101,6 @@ def main():
         w.writerow(["method", "seconds_total", "seconds_per_1000", "prompts_per_second"])
         for name in ["RoBERTa", "BERTweet", "Multilingual", "VADER"]:
             secs = timings[name]
-            _, s_per_1k, pps = fmt_speed(n, secs)
-            # guardo numéricos también
             sec_per_1k_num = secs / (n / 1000.0) if secs > 0 else ""
             pps_num = n / secs if secs > 0 else ""
             w.writerow([name, round(secs, 6), round(sec_per_1k_num, 6), round(pps_num, 6)])

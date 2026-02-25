@@ -95,13 +95,35 @@ def run_label_classifier(X_train, y_train, X_test, y_test, meta_test):
     return preds
 
 
+def normalize_sentiment_label(raw_label: str) -> str:
+    """
+    Normaliza labels de distintos modelos HF + VADER a:
+    POSITIVE / NEUTRAL / NEGATIVE
+    """
+    lab = (raw_label or "").strip().lower()
+
+    # Transformers comunes
+    if "neg" in lab or lab == "label_0":
+        return "NEGATIVE"
+    if "neu" in lab or lab == "label_1":
+        return "NEUTRAL"
+    if "pos" in lab or lab == "label_2":
+        return "POSITIVE"
+
+    # Fallback razonable
+    return "NEUTRAL"
+
+
 # Buena relación accuracy/performance con multilingual.
 # Usar RoBERTa o BERTweet para mejor calidad (más lento).
 
-def run_sentiment_scoring_transformer(X_test, model= 'multilingual'):
+def run_sentiment_labeling(X_test, model="multilingual"):
+    """
+    Devuelve: list[str] con labels normalizados
+    """
     device = 0 if torch.cuda.is_available() else -1
 
-    if model == 'bertweet':
+    if model == "bertweet":
         clf = pipeline(
             "sentiment-analysis",
             model="finiteautomata/bertweet-base-sentiment-analysis",
@@ -119,7 +141,7 @@ def run_sentiment_scoring_transformer(X_test, model= 'multilingual'):
             max_length=128,
             device=device
         )
-    elif model == 'roberta':
+    elif model == "roberta":
         clf = pipeline(
             "sentiment-analysis",
             model="cardiffnlp/twitter-roberta-base-sentiment-latest",
@@ -129,45 +151,34 @@ def run_sentiment_scoring_transformer(X_test, model= 'multilingual'):
             device=device
         )
     else:
-        # VADER low cost: devolver mismo formato que transformers
+        # VADER: solo label (sin score)
         analyzer = SentimentIntensityAnalyzer()
-        out = []
+        out_labels = []
         for t in X_test:
             c = analyzer.polarity_scores(t)["compound"]  # [-1, 1]
-            # Map a label (umbral estándar)
             if c <= -0.05:
-                lab = "NEGATIVE"
+                out_labels.append("NEGATIVE")
             elif c >= 0.05:
-                lab = "POSITIVE"
+                out_labels.append("POSITIVE")
             else:
-                lab = "NEUTRAL"
-            out.append({"label": lab, "score": abs(float(c))})
-        return out
+                out_labels.append("NEUTRAL")
+        return out_labels
 
-    # Si estamos usando transformer, lo pasamos por CUDA y en batches para ver progreso.
     print("pipeline device param:", device)
     print("torch cuda available:", torch.cuda.is_available())
     print("model device:", next(clf.model.parameters()).device)
+
     batch_size = 128
-    out = []
+    out_labels = []
     for i in tqdm(range(0, len(X_test), batch_size), desc="Sentiment (batches)"):
         batch = X_test[i:i + batch_size]
-        out.extend(clf(batch, batch_size=batch_size))
-    return out
+        preds = clf(batch, batch_size=batch_size)
+        out_labels.extend([normalize_sentiment_label(p.get("label")) for p in preds])
 
-def to_signed_score(d):
-    lab = d["label"].lower()
-    score = float(d["score"])
+    return out_labels
 
-    if "negative" in lab or lab == "label_0" or lab.startswith("neg"):
-        return -score
-    if "positive" in lab or lab == "label_2" or lab.startswith("pos"):
-        return score
 
-    # neutral (LABEL_1 o "neutral")
-    return 0.0
-
-def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_out):
+def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_labels):
     OUTPUT_TURN = Path("outputs/turn_level_predictions.csv")
 
     with OUTPUT_TURN.open("w", newline="", encoding="utf-8") as f:
@@ -180,19 +191,13 @@ def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_out):
             "true_label",
             "pred_label",
             "sentiment_label",
-            #"sentiment_score",
-            "sentiment_signed",
         ])
 
-        for prompt, true_label, pred_label, (chat_id, interaction_count, ts), s in zip(
-                X_test, y_test, pred_labels, meta_test, sent_out
+        for prompt, true_label, pred_label, (chat_id, interaction_count, ts), s_lab in zip(
+            X_test, y_test, pred_labels, meta_test, sent_labels
         ):
-            signed = to_signed_score(s)
             writer.writerow([
-                chat_id, interaction_count, ts, prompt, true_label, pred_label,
-                s["label"],
-                #s["score"],
-                signed
+                chat_id, interaction_count, ts, prompt, true_label, pred_label, s_lab
             ])
 
 def lexical_ratio(text: str) -> float:
@@ -201,20 +206,20 @@ def lexical_ratio(text: str) -> float:
     return (len(set(words)) / len(words)) if words else 0.0
 
 
-def aggregate_conversations(prompts, preds, meta, sentiments):
+def aggregate_conversations(prompts, preds, meta, sentiment_labels):
     """
-    Returns dict: chatId -> list of (prompt, pred_label, interaction_count)
-    Ordenado por interaction_count (turn index) dentro de cada chat.
+    Returns dict: chatId -> list of (prompt, pred_label, interaction_count, ts, sentiment_label)
+    Ordenado por interaction_count dentro de cada chat.
     """
     convo = defaultdict(list)
 
-    # construye la conversación iterando la salida del clasificador
-    for prompt, pred_label, (chat_id, interaction_count, ts), sent in zip(prompts, preds, meta, sentiments):
-        convo[chat_id].append((prompt, pred_label, interaction_count, ts, sent))
+    for prompt, pred_label, (chat_id, interaction_count, ts), sent_lab in zip(
+        prompts, preds, meta, sentiment_labels
+    ):
+        convo[chat_id].append((prompt, pred_label, interaction_count, ts, sent_lab))
 
-    # Ordenar turnos dentro de cada conversación
     for chat_id in convo:
-        convo[chat_id].sort(key=lambda x: x[2])  # x[2] = interaction_count
+        convo[chat_id].sort(key=lambda x: x[2])
 
     return convo
 
@@ -229,9 +234,9 @@ def conversation_metrics(items):
     unique_ratios = []
     labels = []
     timestamps = []
-    sentiments = []
+    sentiment_labels = []
 
-    for prompt, pred_label, interaction_count, ts, sent in items:
+    for prompt, pred_label, interaction_count, ts, sent_lab in items:
         words = prompt.split()
         # contar palabras
         word_counts.append(len(words))
@@ -246,7 +251,7 @@ def conversation_metrics(items):
         labels.append(pred_label)
 
         # agregar sentimientos
-        sentiments.append(sent)
+        sentiment_labels.append(sent_lab)
 
         if ts is not None:
             timestamps.append(ts)
@@ -265,10 +270,7 @@ def conversation_metrics(items):
         duration_minutes = ""
 
     dominant_label = Counter(labels).most_common(1)[0][0]
-
-    mean_sentiment = round(sum(sentiments) / n_turns, 4) if n_turns else 0.0
-    pct_negative = round(sum(1 for s in sentiments if s < -0.05) / n_turns, 4) if n_turns else 0.0
-    pct_positive = round(sum(1 for s in sentiments if s > 0.05) / n_turns, 4) if n_turns else 0.0
+    dominant_sentiment = Counter(sentiment_labels).most_common(1)[0][0] if sentiment_labels else "NEUTRAL"
 
     return {
         "n_turns": n_turns,
@@ -277,12 +279,10 @@ def conversation_metrics(items):
         "question_ratio": sum(question_flags) / n_turns,
         "avg_unique_ratio": sum(unique_ratios) / n_turns,
         "dominant_help_type": dominant_label,
+        "dominant_sentiment": dominant_sentiment,
         "total_words": total_words,
         "label_switch_count": label_switch_count,
         "unique_help_types": unique_help_types,
-        "mean_sentiment": mean_sentiment,
-        "pct_negative": pct_negative,
-        "pct_positive": pct_positive,
     }
 
 
@@ -299,18 +299,16 @@ def main():
     pred_labels = run_label_classifier(X_train, y_train, X_test, y_test, meta_test)
 
     # NLP2: Sentiment scores
-    print("Sentiment scores ....")
-    #sent_scores = run_sentiment_scoring(X_test)
-    sent_out = run_sentiment_scoring_transformer(X_test, model="multilingual")
-    sent_scores = [to_signed_score(d) for d in sent_out]
+    print("Sentiment labels ....")
+    sent_labels = run_sentiment_labeling(X_test, model="multilingual")
 
     # Exportar data a nivel de "turnos" (prompts individuales)
     print("Exporting turn-level CSV ....")
-    export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_out)
+    export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_labels)
 
     print("Aggregating data ....")
     # Métricas de agregación: frecuencias y conteo de features NLP
-    convo_data = aggregate_conversations(X_test, pred_labels, meta_test, sent_scores)
+    convo_data = aggregate_conversations(X_test, pred_labels, meta_test, sent_labels)
 
     # Escritura a disco
     OUTPUT_CONVO = Path("outputs/conversation_level_features.csv")
@@ -328,9 +326,7 @@ def main():
             "label_switch_count",
             "unique_help_types",
             "dominant_help_type",
-            "mean_sentiment",
-            "pct_negative",
-            "pct_positive",
+            "dominant_sentiment",
         ])
 
         for chat_id, items in convo_data.items():
@@ -346,9 +342,7 @@ def main():
                 m["label_switch_count"],
                 m["unique_help_types"],
                 m["dominant_help_type"],
-                m["mean_sentiment"],
-                m["pct_negative"],
-                m["pct_positive"],
+                m["dominant_sentiment"],
             ])
 
     print("Total conversations in test:", len(convo_data))
@@ -364,9 +358,7 @@ def main():
         print(f"  question_ratio: {m['question_ratio']:.2f}")
         print(f"  avg_unique_ratio: {m['avg_unique_ratio']:.2f}")
         print(f"  dominant_help_type: {m['dominant_help_type']}")
-        print(f"  mean_sentiment: {m['mean_sentiment']:.2f}")
-        print(f"  pct_negative: {m['pct_negative']:.2f}")
-        print(f"  pct_positive: {m['pct_positive']:.2f}")
+        print(f"  dominant_sentiment: {m['dominant_sentiment']}")
         print("-" * 40)
 
 
