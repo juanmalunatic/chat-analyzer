@@ -1,3 +1,4 @@
+
 import json
 import csv
 import joblib
@@ -8,12 +9,20 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from tqdm import tqdm
+import torch
+from transformers import pipeline
+
+import sys
+#print("PYTHON EXE:", sys.executable)
+#print("PYTHON VER:", sys.version)
+#print("TORCH VER:", torch.__version__)
+#print("CUDA AVAIL:", torch.cuda.is_available())
 
 TRAIN_PATH = Path("data/train_13k.jsonl")
 TEST_PATH  = Path("data/test_3851.jsonl")
 MODEL_PATH = Path("outputs/help_classifier.joblib")
 FORCE_RETRAIN = False
-
 
 # Extraer únicamente [prompt, label, [meta]] de cada línea del dataset.
 # (meta contiene otros campos que queremos guardar del dataset original)
@@ -86,13 +95,79 @@ def run_label_classifier(X_train, y_train, X_test, y_test, meta_test):
     return preds
 
 
-def run_sentiment_scoring(X_test):
-    analyzer = SentimentIntensityAnalyzer()
-    # Devuelve lista alineada con X_test (mismo largo, mismo orden)
-    sentiments = [analyzer.polarity_scores(t)["compound"] for t in X_test]
-    return sentiments
+# Buena relación accuracy/performance con multilingual.
+# Usar RoBERTa o BERTweet para mejor calidad (más lento).
 
-def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_scores):
+def run_sentiment_scoring_transformer(X_test, model= 'multilingual'):
+    device = 0 if torch.cuda.is_available() else -1
+
+    if model == 'bertweet':
+        clf = pipeline(
+            "sentiment-analysis",
+            model="finiteautomata/bertweet-base-sentiment-analysis",
+            truncation=True,
+            padding=True,
+            max_length=128,
+            device=device
+        )
+    elif model == "multilingual":
+        clf = pipeline(
+            "sentiment-analysis",
+            model="tabularisai/multilingual-sentiment-analysis",
+            truncation=True,
+            padding=True,
+            max_length=128,
+            device=device
+        )
+    elif model == 'roberta':
+        clf = pipeline(
+            "sentiment-analysis",
+            model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+            truncation=True,
+            padding=True,
+            max_length=128,
+            device=device
+        )
+    else:
+        # VADER low cost: devolver mismo formato que transformers
+        analyzer = SentimentIntensityAnalyzer()
+        out = []
+        for t in X_test:
+            c = analyzer.polarity_scores(t)["compound"]  # [-1, 1]
+            # Map a label (umbral estándar)
+            if c <= -0.05:
+                lab = "NEGATIVE"
+            elif c >= 0.05:
+                lab = "POSITIVE"
+            else:
+                lab = "NEUTRAL"
+            out.append({"label": lab, "score": abs(float(c))})
+        return out
+
+    # Si estamos usando transformer, lo pasamos por CUDA y en batches para ver progreso.
+    print("pipeline device param:", device)
+    print("torch cuda available:", torch.cuda.is_available())
+    print("model device:", next(clf.model.parameters()).device)
+    batch_size = 128
+    out = []
+    for i in tqdm(range(0, len(X_test), batch_size), desc="Sentiment (batches)"):
+        batch = X_test[i:i + batch_size]
+        out.extend(clf(batch, batch_size=batch_size))
+    return out
+
+def to_signed_score(d):
+    lab = d["label"].lower()
+    score = float(d["score"])
+
+    if "negative" in lab or lab == "label_0" or lab.startswith("neg"):
+        return -score
+    if "positive" in lab or lab == "label_2" or lab.startswith("pos"):
+        return score
+
+    # neutral (LABEL_1 o "neutral")
+    return 0.0
+
+def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_out):
     OUTPUT_TURN = Path("outputs/turn_level_predictions.csv")
 
     with OUTPUT_TURN.open("w", newline="", encoding="utf-8") as f:
@@ -104,13 +179,21 @@ def export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_scores):
             "prompt",
             "true_label",
             "pred_label",
-            "sentiment_compound",
+            "sentiment_label",
+            #"sentiment_score",
+            "sentiment_signed",
         ])
 
-        for prompt, true_label, pred_label, (chat_id, interaction_count, ts), sent in zip(
-            X_test, y_test, pred_labels, meta_test, sent_scores
+        for prompt, true_label, pred_label, (chat_id, interaction_count, ts), s in zip(
+                X_test, y_test, pred_labels, meta_test, sent_out
         ):
-            writer.writerow([chat_id, interaction_count, ts, prompt, true_label, pred_label, sent])
+            signed = to_signed_score(s)
+            writer.writerow([
+                chat_id, interaction_count, ts, prompt, true_label, pred_label,
+                s["label"],
+                #s["score"],
+                signed
+            ])
 
 def lexical_ratio(text: str) -> float:
     words = text.split()
@@ -217,11 +300,13 @@ def main():
 
     # NLP2: Sentiment scores
     print("Sentiment scores ....")
-    sent_scores = run_sentiment_scoring(X_test)
+    #sent_scores = run_sentiment_scoring(X_test)
+    sent_out = run_sentiment_scoring_transformer(X_test, model="multilingual")
+    sent_scores = [to_signed_score(d) for d in sent_out]
 
     # Exportar data a nivel de "turnos" (prompts individuales)
     print("Exporting turn-level CSV ....")
-    export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_scores)
+    export_turn_level_csv(X_test, y_test, pred_labels, meta_test, sent_out)
 
     print("Aggregating data ....")
     # Métricas de agregación: frecuencias y conteo de features NLP
